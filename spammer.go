@@ -1,10 +1,16 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
-	"sort"
+	"log"
+	"slices"
 	"sync"
 )
+
+func logError(stage, format string, args ...any) {
+	log.Printf("ERROR ["+stage+"] "+format, args...)
+}
 
 func RunPipeline(cmds ...cmd) {
 	wg := &sync.WaitGroup{}
@@ -24,22 +30,32 @@ func RunPipeline(cmds ...cmd) {
 }
 
 func SelectUsers(in, out chan interface{}) {
+	// in - string
+	// out - User
 	wg := &sync.WaitGroup{}
 	mu := &sync.Mutex{}
-	seen := make(map[uint64]bool)
+	seen := make(map[uint64]struct{})
 
 	for emailRaw := range in {
-		email := emailRaw.(string)
+		email, ok := emailRaw.(string)
+		if !ok {
+			logError("SelectUsers", "wrong input type: want string, got %T (%v)", emailRaw, emailRaw)
+			continue
+		}
+
 		wg.Add(1)
 		go func(e string) {
 			defer wg.Done()
 			user := GetUser(e)
-			mu.Lock()
-			isUnique := !seen[user.ID]
-			if isUnique {
-				seen[user.ID] = true
-			}
-			mu.Unlock()
+			isUnique := func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				_, already := seen[user.ID]
+				if !already {
+					seen[user.ID] = struct{}{}
+				}
+				return !already
+			}()
 			if isUnique {
 				out <- user
 			}
@@ -49,6 +65,8 @@ func SelectUsers(in, out chan interface{}) {
 }
 
 func SelectMessages(in, out chan interface{}) {
+	// in - User
+	// out - MsgID
 	wg := &sync.WaitGroup{}
 	batch := make([]User, 0, GetMessagesMaxUsersBatch)
 
@@ -57,16 +75,23 @@ func SelectMessages(in, out chan interface{}) {
 		go func(users []User) {
 			defer wg.Done()
 			res, err := GetMessages(users...)
-			if err == nil {
-				for _, id := range res {
-					out <- id
-				}
+			if err != nil {
+				logError("SelectMessages", "GetMessages failed: %v (users: %v)", err, users)
+				return
+			}
+			for _, id := range res {
+				out <- id
 			}
 		}(b)
 	}
 
 	for val := range in {
-		batch = append(batch, val.(User))
+		user, ok := val.(User)
+		if !ok {
+			logError("SelectMessages", "wrong input type: want User, got %T", val)
+			continue
+		}
+		batch = append(batch, user)
 		if len(batch) == GetMessagesMaxUsersBatch {
 			b := make([]User, len(batch))
 			copy(b, batch)
@@ -82,36 +107,55 @@ func SelectMessages(in, out chan interface{}) {
 }
 
 func CheckSpam(in, out chan interface{}) {
+	// in - MsgID
+	// out - MsgData
 	wg := &sync.WaitGroup{}
-	quota := make(chan struct{}, 5)
+	quota := make(chan struct{}, HasSpamMaxAsyncRequests)
 
 	for msgIdRaw := range in {
-		msgId := msgIdRaw.(MsgID)
+		msgId, ok := msgIdRaw.(MsgID)
+		if !ok {
+			logError("CheckSpam", "wrong input type: want MsgID, got %T", msgIdRaw)
+			continue
+		}
+
 		wg.Add(1)
 		quota <- struct{}{}
 		go func(id MsgID) {
 			defer wg.Done()
 			defer func() { <-quota }()
 			isSpam, err := HasSpam(id)
-			if err == nil {
-				out <- MsgData{ID: id, HasSpam: isSpam}
+			if err != nil {
+				logError("CheckSpam", "HasSpam failed for id=%v: %v", id, err)
+				return
 			}
+			out <- MsgData{ID: id, HasSpam: isSpam}
 		}(msgId)
 	}
 	wg.Wait()
 }
 
 func CombineResults(in, out chan interface{}) {
+	// in - MsgData
+	// out - string
 	var results []MsgData
 	for val := range in {
-		results = append(results, val.(MsgData))
+		result, ok := val.(MsgData)
+		if !ok {
+			logError("CombineResults", "wrong input type: want MsgData, got %T (%v)", val, val)
+			continue
+		}
+		results = append(results, result)
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].HasSpam != results[j].HasSpam {
-			return results[i].HasSpam
+	slices.SortFunc(results, func(a, b MsgData) int {
+		if a.HasSpam != b.HasSpam {
+			if a.HasSpam {
+				return -1
+			}
+			return 1
 		}
-		return results[i].ID < results[j].ID
+		return cmp.Compare(a.ID, b.ID)
 	})
 
 	for _, r := range results {
